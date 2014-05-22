@@ -7,8 +7,20 @@ import (
 	"io"
 	"errors"
 	"flag"
+	"strings"
+	"math/rand"
+	"time"
 	"github.com/miekg/dns"
 	"github.com/garyburd/redigo/redis"
+)
+
+var (
+	listenAddr string
+	listenPort int
+	useRedis bool
+	redisHost string
+	redisPort int
+	nameservers []string
 )
 
 func redisGet (c redis.Conn, host string) (string, bool, error) {
@@ -30,53 +42,81 @@ func redisSet (c redis.Conn, host string, ip string, ttl uint32) error {
 }
 
 func dnsLookup(host string) (string, uint32, error) {
+
+	var (
+		result string
+		ttl uint32
+		hit bool = false
+	)
+
 	msg := new(dns.Msg)
 	msg.SetQuestion(fmt.Sprintf("%s.", host), dns.TypeA)
 
+	nameserver := fmt.Sprintf("%s:%d", getNameserver(), 53)
+
 	c := new(dns.Client)
-	in, _, err := c.Exchange(msg, "ns1.jimdo.com:53")
+	in, _, err := c.Exchange(msg, nameserver)
 	if err != nil {
 		return "", 0, err
 	}
 
 	if t, ok := in.Answer[0].(*dns.A); ok {
-		return t.A.String(), t.Header().Ttl, nil
+		result, ttl = t.A.String(), t.Header().Ttl
+		hit = true
 	}
 
 	if t, ok := in.Answer[0].(*dns.CNAME); ok {
-		return t.Target, t.Header().Ttl, nil
+		result, ttl = t.Target, t.Header().Ttl
+		hit = true
 	}
 
-	return "", 0, errors.New("lookup failed.")
+	if hit {
+		log.Printf("DNS lookup on <%s> succeeded: <%s> => <%s>\n", nameserver, host, result)
+		return result, ttl, nil
+	} else {
+		return "", 0, errors.New("lookup failed.")
+	}
 }
 
 func lookup (host string) (string, error) {
 
-	redis_conn, err := redis.Dial("tcp", ":6379")
-	if err != nil {
-		log.Fatal("cannot connect to redis: ", err)
-	}
-	defer redis_conn.Close()
+	var (
+		redis_conn redis.Conn
+		result string
+		err error
+		hit bool
+		ttl uint32
+	)
 
-	h, hit, err := redisGet(redis_conn, host)
-	if err != nil {
-		log.Println("redisGet error: ", err)
-	} else if hit {
-		log.Printf("Redis hit for Host <%s>: <%s>\n", host, h)
-		return h, nil
+
+	if useRedis {
+		redis_conn, err = redis.Dial("tcp", ":6379")
+		if err != nil {
+			log.Fatal("cannot connect to redis: ", err)
+		}
+		defer redis_conn.Close()
+
+		result, hit, err = redisGet(redis_conn, host)
+		if err != nil {
+			log.Println("redisGet error: ", err)
+		} else if hit {
+			log.Printf("Redis hit for Host <%s>: <%s>\n", host, result)
+			return result, nil
+		}
 	}
 
-	h, ttl, err := dnsLookup(host)
+	result, ttl, err = dnsLookup(host)
 	if err != nil {
 		return "", err
 	}
 
-	if err := redisSet(redis_conn, host, h, ttl); err != nil {
-		log.Println("redisSet error: ", err)
+	if useRedis {
+		if err = redisSet(redis_conn, host, result, ttl); err != nil {
+			log.Println("redisSet error: ", err)
+		}
 	}
 
-	log.Printf("DNS hit for Host <%s>: <%s>\n", host, h)
-	return h, nil
+	return result, nil
 }
 
 func internalServerError(w http.ResponseWriter) {
@@ -122,16 +162,27 @@ func dnsHandlerFunc(w http.ResponseWriter, r *http.Request) {
 	resp.Body.Close()
 }
 
+func getNameserver () string {
+	return nameservers[rand.Intn(len(nameservers))]
+}
+
 func main() {
 	// XXX flags: useRedis true/false, redisAddr, redisPort
 	// XXX flags: nameservers=wurst.brot.de,koffer.geloet.com
 
-	listenAddr := flag.String("listenAddr", "127.0.0.1", "interface to listen on")
-	listenPort := flag.Int("listenPort", 8080, "port to listen on")
+	flag.StringVar(&listenAddr, "listenAddr", "127.0.0.1", "interface to listen on")
+	flag.IntVar(&listenPort, "listenPort", 8080, "port to listen on")
+	flag.BoolVar(&useRedis, "useRedis", false, "wether or not to use a redis cache for DNS results")
+	flag.StringVar(&redisHost, "redisHost", "127.0.0.1", "redis host to connect to")
+	flag.IntVar(&redisPort, "redisPort", 6379, "redis port to connect to")
+	strNameservers := flag.String("nameservers", "8.8.8.8;8.8.4.4", "nameservers to cycle through")
 
 	flag.Parse()
 
-	listen := fmt.Sprintf("%s:%d", *listenAddr, *listenPort)
+	nameservers = strings.Split(*strNameservers, ";")
+	rand.Seed(time.Now().UTC().UnixNano())
+
+	listen := fmt.Sprintf("%s:%d", listenAddr, listenPort)
 
 	dnsHandler := http.HandlerFunc(dnsHandlerFunc)
 	log.Printf("starting up on %s.\n", listen)
